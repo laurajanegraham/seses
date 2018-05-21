@@ -1,0 +1,264 @@
+---
+title: 'SESES: Recreation Model'
+author: "Laura Graham"
+output: html_document
+bibliography: C:/Users/lg1u16/Documents/mendeley_bibtex/library.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# load required packages
+library(raster)
+library(rgeos)
+library(tidyverse)
+#library(rgrass7)
+library(winmoveR)
+
+
+# set ggplot options
+theme_set(theme_classic() + theme(strip.background = element_blank()))
+
+# required coordinate strings
+crs_bng <- "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +towgs84=446.448,-125.157,542.06,0.15,0.247,0.842,-20.489 +units=m +no_defs "
+
+crs_wgs84 <- "+proj=longlat +datum=WGS84"
+
+# study area bounding box
+convert_coords <- function(deg, min, sec) {
+  coord <- deg + min/60 + sec/60^2
+}
+
+xmin <- convert_coords(2, 19, 44)
+xmax <- convert_coords(1, 30, 44)
+ymin <- convert_coords(50, 58, 44)
+ymax <- convert_coords(51, 25, 40)
+
+
+# create a 5km grid for the analysis (NB this makes the overall area slightly larger than
+# originally specified - need to check against the points from Lucy when I have them as to
+# how much of an issue this might be)
+es_grid <- raster(extent(-xmin, -xmax, ymin, ymax), crs = crs_wgs84) %>% 
+  projectExtent(crs = crs_bng)
+
+# 5km resolution
+res(es_grid) <- 5000
+
+# create polygrid
+es_grid <- as(es_grid, 'SpatialPolygonsDataFrame')
+
+# now we need a couple of buffered versions of the study area for cropping and snapping
+# 10km buffer for extracting data to allow for moving window to avoid edge effects
+study_bbox_10km <- gBuffer(es_grid, width = 10000, capStyle = "SQUARE", 
+                           joinStyle = "MITRE", mitreLimit = 10000/2)
+
+# 10km buffered raster at 25m resolution to snap data to
+ras_10km <- raster(extent(study_bbox_10km))
+res(ras_10km) <- c(25, 25)
+
+# this one for intermediary cropping of dem before transforming crs
+study_bbox_20km <- gBuffer(es_grid, width = 20000, capStyle = "SQUARE", 
+                           joinStyle = "MITRE", mitreLimit = 20000/2)
+```
+
+## Study area
+
+Following @Ridding2018, the study area will use the following coordinates: `r extent(es_grid)`. This is a bounding box around the Wessex BESS site. Note that these coordinates are slightly wider than the original study area so that we could create a 5 x 5 km grid for analysis. 
+
+We aim to use 25 m resolution land-cover and topography data to estimate relative recreation in each 5 km resolution cell in the study area. 
+
+## Model design
+
+Developed during CEH meeting (2018-03-27) - key factors include access, suitability for recreation, quality for recreation. 
+
+```{r show_design}
+knitr::include_graphics("figures/WESSEX BESS Recreation.png")
+```
+
+## Data
+
+### Land cover
+
+LCM 2015 [@Rowland2017] data were downloaded from Edina Digimap.
+
+```{r load_lcm, eval = TRUE}
+lcm <- raster("~/DATA/LULC/lcm2015/lcm2015gb25m.tif")
+study_bbox_lcm <- spTransform(study_bbox_10km, crs(lcm))
+lcm_site <- crop(lcm, study_bbox_lcm)
+lcm_site <- resample(lcm_site, ras_10km, method = "ngb")
+crs(lcm_site) <- crs(lcm)
+plot(lcm_site)
+writeRaster(lcm_site, "data/lcm_site.tif", overwrite = TRUE)
+```
+
+
+### Topography
+
+EU-DEM data were downloaded from [European Environment Agency](https://www.eea.europa.eu/data-and-maps/data/copernicus-land-monitoring-service-eu-dem). 
+
+```{r load_dem, eval = TRUE}
+dem <- raster("~/DATA/PHYSICAL/elev/eu_dem_1.1/eudem_dem_3035_europe.tif")
+study_bbox_dem <- spTransform(study_bbox_20km, crs(dem))
+dem_site <- crop(dem, study_bbox_dem)
+# all data going to be transformed to same as the LCM data. 
+dem_site <- projectRaster(dem_site, crs = crs(lcm))
+dem_site <- crop(dem_site, lcm_site)
+dem_site <- resample(dem_site, lcm_site)
+crs(dem_site) <- crs(lcm)
+plot(dem_site) 
+storage.mode(dem_site[]) = "integer" # reduces file size by 2/3, decimals not really needed
+writeRaster(dem_site, "data/dem_site.tif", overwrite = TRUE)
+```
+
+Study area (topography as hillshade, and land cover classes)
+
+```{r plot_site}
+dem_site <- raster("data/dem_site.tif")
+slope <- terrain(dem_site, opt = "slope")
+aspect <- terrain(dem_site, opt = "aspect")
+hill <- hillShade(slope, aspect)
+
+lcm_site <- raster("data/lcm_site.tif") 
+
+lcm_lookup <- read_csv("~/DATA/LULC/lcm2015/lcm_lookup.csv")
+
+dat <- stack(lcm_site, hill)
+
+dat_df <- as.data.frame(dat, xy = TRUE) %>% na.omit %>% filter(lcm_site != 0) %>% 
+  inner_join(lcm_lookup, by = c("lcm_site" = "lcm_id")) %>% 
+  mutate(lcm_class = factor(lcm_class, levels = lcm_lookup$lcm_class),
+         plot_col = rgb(red = red, green = green, blue = blue, maxColorValue = 255)) %>% 
+  select(x, y, hillshade = layer, lcm_site, lcm_class, plot_col)
+
+plot_cols <- group_by(dat_df, lcm_class) %>% summarise(plot_col = unique(plot_col)) %>% pull(plot_col)
+
+ggplot(dat_df, aes(x = x, y = y)) + 
+  geom_raster(aes(fill = lcm_class, alpha = hillshade)) + 
+  scale_fill_manual(values = plot_cols, name = "Land cover class") + 
+  scale_alpha(guide = "none") + 
+  labs(x = "", y = "") +
+  coord_equal()
+```
+
+## Variables
+
+### Access
+
+Proportion that is urban (20) or suburban (21) within a 2km radius (for now) window
+
+```{r}
+access <- winmove_nbrhd(lcm_site, 2000, "rectangle", "prop", lcm_class = c(20, 21))
+```
+
+
+### Land-cover suitability
+
+Local scale (i.e. cell scale) binary measure when LC is in all except for urban (20), suburban (21), freshwater (14), saltwater (13). This list may need revising. 
+
+```{r}
+check_suitable <- function(x) {
+  ifelse(x %in% c(13, 14, 20, 21), 0, 1)
+}
+
+lc_suitable <- raster::calc(lcm_site, fun = check_suitable)
+plot(lc_suitable)
+```
+
+
+### Land-cover diversity
+
+Shannon diversity of all LC classes (argument for this is that as long as it's mixed with natural stuff, view of villages etc. is nice??) within (a) viewshed or (b) square window. Viewshed should be calculated within r.viewshed in grass - can use the execGRASS function in rgrass7. This is not ideal (if we want to create package etc.) but will have to do for now.
+
+Thoughts on how to do (a):
+
+- firstly, check whether it makes any difference (for a sample of points - n = 100? - compare the value from viewshed version and the value from a straight up Shannon calculation - can compare with correlation or paired t-test)
+- build the r.viewshed call into a function for winmoveR
+- have a look at the [c++ total viewshed code](https://github.com/tombh/total-viewsheds) and see if I can build in Shannon diversity calculation into this: this will involve adding code between the 0/1 viewshed calculation and the total area visible per cell calculation; the Shannon calculation on the multiplied surfaces can then be used.
+
+```{r lc_viewshed, eval = FALSE}
+initGRASS(gisBase = "C:/Program Files/GRASS GIS 7.4.0", home = "data", 
+          gisDbase = "data",
+          location = "grass_data", mapset = "PERMANENT", override = TRUE)
+
+execGRASS("g.proj", flags = c("c", "quiet"), 
+          proj4 = proj4string(lcm_site))
+b_box = extent(lcm_site) 
+execGRASS("g.region", flags = c("quiet"), 
+          n = as.character(b_box[4]), s = as.character(b_box[3]), 
+          e = as.character(b_box[2]), w = as.character(b_box[1]), 
+          res = "1")
+
+writeRAST(as(lcm_site, "SpatialGridDataFrame"), vname = "lcm_site")
+writeRAST(as(dem_site, "SpatialGridDataFrame"), vname = "dem_site")
+
+pts_sample <- pts[sample(1:nrow(pts), 100), 1:2]
+
+calc_viewshed_diversity <- function(coords) {
+  
+  execGRASS("g.region", 
+            n = as.character(coords[2] + 5000), 
+            s = as.character(coords[2] - 5000), 
+            e = as.character(coords[1] + 5000), 
+            w = as.character(coords[1] - 5000))
+  
+  dtime <- str_extract_all(Sys.time(), "\\d+", simplify = TRUE) %>% str_flatten
+  vs_tempfile <- paste0("vs_", dtime)
+  ls_tempfile <- paste0("ls_", dtime)
+  area_tempfile <- paste0("area_", dtime)
+  execGRASS(cmd = "r.viewshed", input = "dem_site", output = vs_tempfile, 
+            coordinates = coords, memory = 20000)
+  execGRASS(cmd = "r.mapcalc", expression = paste0(area_tempfile, ' = if(', vs_tempfile, ')'), 
+            flags = "overwrite")
+  execGRASS(cmd = "r.mapcalc", expression = paste0(ls_tempfile, ' = if(', vs_tempfile, ') * lcm_site'), 
+            flags = "overwrite")
+  vs <- readRAST(vs_tempfile) %>% raster
+  lc <- readRAST(ls_tempfile) %>% raster
+  area <- readRAST(area_tempfile) %>% raster
+  
+  div <- diversity(lc, lc_class = 1:21)
+  area <- sum(as.vector(vs), na.rm = TRUE)
+  execGRASS("g.remove", name = c(vs_tempfile, ls_tempfile, area_tempfile), type = "raster", flags = "f")
+  return(list(div = div, area = area))
+}
+
+strt <- Sys.time()
+vs_lc_div <- lapply(1:nrow(pts_sample), function(x) {
+  coords <- as.numeric(pts_sample[x,])
+  calc_viewshed_diversity(coords)
+})
+vs_lc_div_calctime <- Sys.time() - strt
+
+
+strt <- Sys.time()
+pts_sample$win_lc_div <- apply(pts_sample, 1, function(coords) {
+  xmin = coords[1] - 5000
+  xmax = coords[1] + 5000 
+  ymin = coords[2] - 5000 
+  ymax = coords[2] + 5000 
+  
+  lcm_sml <- crop(lcm_site, extent(c(xmin, xmax, ymin, ymax)))
+  diversity(lcm_sml, lc_class = 1:21)
+}) 
+win_lc_div_calctime <- Sys.time() - strt
+
+ggplot(pts_sample, aes(x = win_lc_div, y = vs_lc_div)) + 
+  geom_point() + 
+  geom_smooth(method = "lm")
+
+files <- list.files("data/grass_data/PERMANENT/cell/", pattern = "vs_")
+```
+
+Currently the viewshed calculation takes a long time for each cell. Going for option (b) for now and calculating within a square window. 
+
+
+### Topographic heterogeneity
+
+Variance in altitude within buffer (say 2km radius for now again)
+
+## Recreation model
+
+Idea here is to demonstrate that if we only have data on LC and elevation, if we model at the right scale and with an understanding of the generating mechanism, we may get something akin to the relative ES values. A kind of improved benefit transfer. 
+
+Recreation = (access + LC diversity + topographic heterogeneity) * LC suitability
+
+## References
