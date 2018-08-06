@@ -2,18 +2,24 @@
 title: 'SESES: Recreation Model'
 author: "Laura Graham"
 output: html_document
-bibliography: C:/Users/lg1u16/Documents/mendeley_bibtex/library.bib
+bibliography: C:/Users/lg1u16/DATA/BIBLIOGRAPHY/library.bib
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = FALSE)
 
 # load required packages
+library(MASS)
 library(raster)
+library(rgdal)
 library(rgeos)
 library(tidyverse)
+library(cowplot)
+library(ggmap)
+library(GGally)
+library(DHARMa)
 #library(rgrass7)
-library(winmoveR)
+library(grainchanger) # needs installing via devtools::install_github("laurajanegraham/grainchanger")
 
 
 # set ggplot options
@@ -38,14 +44,16 @@ ymax <- convert_coords(51, 25, 40)
 # create a 5km grid for the analysis (NB this makes the overall area slightly larger than
 # originally specified - need to check against the points from Lucy when I have them as to
 # how much of an issue this might be)
-es_grid <- raster(extent(-xmin, -xmax, ymin, ymax), crs = crs_wgs84) %>% 
+es_ras <- raster(extent(-xmin, -xmax, ymin, ymax), crs = crs_wgs84) %>% 
   projectExtent(crs = crs_bng)
 
+es_grid <- as(es_ras, 'SpatialPolygonsDataFrame')
+
 # 5km resolution
-res(es_grid) <- 5000
+res(es_ras) <- 5000
 
 # create polygrid
-es_grid <- as(es_grid, 'SpatialPolygonsDataFrame')
+es_grid <- as(es_ras, 'SpatialPolygonsDataFrame')
 
 # now we need a couple of buffered versions of the study area for cropping and snapping
 # 10km buffer for extracting data to allow for moving window to avoid edge effects
@@ -53,7 +61,7 @@ study_bbox_10km <- gBuffer(es_grid, width = 10000, capStyle = "SQUARE",
                            joinStyle = "MITRE", mitreLimit = 10000/2)
 
 # 10km buffered raster at 25m resolution to snap data to
-ras_10km <- raster(extent(study_bbox_10km))
+ras_10km <- raster(extent(study_bbox_10km), crs = crs(es_grid))
 res(ras_10km) <- c(25, 25)
 
 # this one for intermediary cropping of dem before transforming crs
@@ -63,7 +71,7 @@ study_bbox_20km <- gBuffer(es_grid, width = 20000, capStyle = "SQUARE",
 
 ## Study area
 
-Following @Ridding2018, the study area will use the following coordinates: `r extent(es_grid)`. This is a bounding box around the Wessex BESS site. Note that these coordinates are slightly wider than the original study area so that we could create a 5 x 5 km grid for analysis. 
+Following @Ridding2018, the study area will use the following coordinates: `r round(extent(es_grid), 2)`. This is a bounding box around the Wessex BESS site. Note that these coordinates are slightly wider than the original study area so that we could create a 5 x 5 km grid for analysis. 
 
 We aim to use 25 m resolution land-cover and topography data to estimate relative recreation in each 5 km resolution cell in the study area. 
 
@@ -77,26 +85,30 @@ knitr::include_graphics("figures/WESSEX BESS Recreation.png")
 
 ## Data
 
-### Land cover
+### Recreation
 
-LCM 2015 [@Rowland2017] data were downloaded from Edina Digimap.
+We have point locations for recreation from the PPGIS study [@Ridding2018], we are going to aggregate these to get intensity within 5km resolution for the study site. 
 
-```{r load_lcm, eval = TRUE}
-lcm <- raster("~/DATA/LULC/lcm2015/lcm2015gb25m.tif")
-study_bbox_lcm <- spTransform(study_bbox_10km, crs(lcm))
-lcm_site <- crop(lcm, study_bbox_lcm)
-lcm_site <- resample(lcm_site, ras_10km, method = "ngb")
-crs(lcm_site) <- crs(lcm)
-plot(lcm_site)
-writeRaster(lcm_site, "data/lcm_site.tif", overwrite = TRUE)
+```{r}
+rec_pts <- readOGR("data", "All_PPGIS_points_LR")
+
+rec_ras <- rasterize(rec_pts, es_ras, 'LUCY_FID', fun=function(x,...)length(x))
+
+plot(rec_ras)
 ```
 
+## Environment
 
-### Topography
+LCM 2015 [@Rowland2017] data were downloaded from Edina Digimap.EU-DEM data were downloaded from [European Environment Agency](https://www.eea.europa.eu/data-and-maps/data/copernicus-land-monitoring-service-eu-dem).
 
-EU-DEM data were downloaded from [European Environment Agency](https://www.eea.europa.eu/data-and-maps/data/copernicus-land-monitoring-service-eu-dem). 
+```{r load_env, eval = FALSE}
+# Land cover map
+lcm <- raster("~/DATA/LULC/lcm2015/lcm2015gb25m.tif")
+lcm_site <- resample(lcm_site, ras_10km, method = "ngb")
+plot(lcm_site)
+writeRaster(lcm_site, "data/lcm_site.tif", overwrite = TRUE)
 
-```{r load_dem, eval = TRUE}
+# DEM 
 dem <- raster("~/DATA/PHYSICAL/elev/eu_dem_1.1/eudem_dem_3035_europe.tif")
 study_bbox_dem <- spTransform(study_bbox_20km, crs(dem))
 dem_site <- crop(dem, study_bbox_dem)
@@ -142,12 +154,21 @@ ggplot(dat_df, aes(x = x, y = y)) +
 
 ## Variables
 
+All variables will be created from either LCM or Elevation (or a combination).
+
 ### Access
 
 Proportion that is urban (20) or suburban (21) within a 2km radius (for now) window
 
+```{r calc_access, cache = TRUE}
+system.time(access <- winmove(lcm_site, 2000, "rectangle", "prop", lc_class = c(20, 21)))
+access <- crop(access, es_grid)
+save(access, file = "results/access.Rda")
+```
+
 ```{r}
-access <- winmove_nbrhd(lcm_site, 2000, "rectangle", "prop", lcm_class = c(20, 21))
+load("results/access.Rda")
+plot(access)
 ```
 
 
@@ -155,19 +176,24 @@ access <- winmove_nbrhd(lcm_site, 2000, "rectangle", "prop", lcm_class = c(20, 2
 
 Local scale (i.e. cell scale) binary measure when LC is in all except for urban (20), suburban (21), freshwater (14), saltwater (13). This list may need revising. 
 
-```{r}
+```{r calc_suitable, cache = TRUE}
 check_suitable <- function(x) {
-  ifelse(x %in% c(13, 14, 20, 21), 0, 1)
+  ifelse(x %in% c(0, 13, 14, 20, 21), 0, 1)
 }
 
 lc_suitable <- raster::calc(lcm_site, fun = check_suitable)
+lc_suitable <- crop(lc_suitable, es_grid)
+save(lc_suitable, file = "results/lc_suitable.Rda")
+```
+
+```{r}
+load("results/lc_suitable.Rda")
 plot(lc_suitable)
 ```
 
-
 ### Land-cover diversity
 
-Shannon diversity of all LC classes (argument for this is that as long as it's mixed with natural stuff, view of villages etc. is nice??) within (a) viewshed or (b) square window. Viewshed should be calculated within r.viewshed in grass - can use the execGRASS function in rgrass7. This is not ideal (if we want to create package etc.) but will have to do for now.
+Shannon diversity of all LC classes (argument for this is that as long as it's mixed with natural stuff, view of villages etc. is nice??) within (a) viewshed or (b) 5km square window. Viewshed should be calculated within r.viewshed in grass - can use the execGRASS function in rgrass7. This is not ideal (if we want to create package etc.) but will have to do for now.
 
 Thoughts on how to do (a):
 
@@ -175,7 +201,7 @@ Thoughts on how to do (a):
 - build the r.viewshed call into a function for winmoveR
 - have a look at the [c++ total viewshed code](https://github.com/tombh/total-viewsheds) and see if I can build in Shannon diversity calculation into this: this will involve adding code between the 0/1 viewshed calculation and the total area visible per cell calculation; the Shannon calculation on the multiplied surfaces can then be used.
 
-```{r lc_viewshed, eval = FALSE}
+```{r calc_diversity_vs, eval = FALSE}
 initGRASS(gisBase = "C:/Program Files/GRASS GIS 7.4.0", home = "data", 
           gisDbase = "data",
           location = "grass_data", mapset = "PERMANENT", override = TRUE)
@@ -250,15 +276,156 @@ files <- list.files("data/grass_data/PERMANENT/cell/", pattern = "vs_")
 
 Currently the viewshed calculation takes a long time for each cell. Going for option (b) for now and calculating within a square window. 
 
+```{r calc_diversity_win, cache = TRUE}
+# for some reason there are 4 cells with a LC type of 0. 
+lc_class <- unique(lcm_site)
+lc_class <- lc_class[lc_class != 0]
+system.time(lc_diversity <- winmove(lcm_site, 5000, "rectangle", "diversity", lc_class = lc_class))
+lc_diversity <- crop(lc_diversity, es_grid)
+save(lc_diversity, file = "results/lc_diversity.Rda")
+```
+
+```{r}
+load("results/lc_diversity.Rda")
+plot(lc_diversity)
+```
 
 ### Topographic heterogeneity
 
 Variance in altitude within buffer (say 2km radius for now again)
 
+```{r calc_topo, cache = TRUE}
+system.time(topo <- winmove(dem_site, 2000, "rectangle", "var"))
+topo <- crop(topo, es_grid)
+save(topo, file = "results/topo.Rda")
+```
+
+```{r}
+load("results/topo.Rda")
+plot(topo)
+```
+
 ## Recreation model
+
+Gonna multiply each predictor by land cover suitability to get a surface of potential recreation quality, aggregate, then fit to recreation data. 
+
+```{r, eval = FALSE}
+access_5km <- aggregate(access * lc_suitable, 200) 
+lc_diversity_5km <- aggregate(lc_diversity * lc_suitable, 200)
+topo_5km <- aggregate(topo * lc_suitable, 200)
+
+all_data <- stack(list(rec = rec_ras, access = access_5km, lc_diversity = lc_diversity_5km, topo = topo_5km)) %>% 
+  as.data.frame(xy = TRUE) %>% 
+  na.omit
+
+ggpairs(all_data %>% select(-x, -y))
+
+ggplot(all_data, aes(x = rec)) + geom_histogram()
+```
+
+```{r, eval = FALSE}
+rec_mod <- glm.nb(rec ~ access * lc_diversity * topo, data = all_data)
+rec_mod_r2 <- 1 - (rec_mod$deviance / rec_mod$null.deviance)
+
+summary(rec_mod)
+rec_mod_r2
+```
+
+```{r, eval = FALSE}
+library(DHARMa)
+simulationOutput <- simulateResiduals(fittedModel = rec_mod, n = 250)
+
+plotSimulatedResiduals(simulationOutput)
+```
 
 Idea here is to demonstrate that if we only have data on LC and elevation, if we model at the right scale and with an understanding of the generating mechanism, we may get something akin to the relative ES values. A kind of improved benefit transfer. 
 
 Recreation = (access + LC diversity + topographic heterogeneity) * LC suitability
+
+```{r output_recmod, eval = FALSE}
+rec <- (access + lc_diversity + topo) * lc_suitable
+all_data <- stack(list(access = access, lc_suitable = lc_suitable, 
+                       lc_diversity = lc_diversity, topo = topo, rec = rec))
+
+
+plot(all_data)
+save(all_data, file = "results/all_data.rda")
+save(rec, file = "results/rec_pred.rda")
+```
+
+Now let's aggregate the recreation model and compare it to the data
+
+```{r, eval = FALSE}
+load("results/rec_pred.rda")
+rec_pred <- aggregate(rec, fact = 200)
+rec_comp <- stack(list(rec_data = rec_ras, rec_pred = rec_pred)) %>% 
+  as.data.frame(xy = TRUE) %>% na.omit
+
+rec_data_plot <- ggplot(rec_comp, aes(x = x, y = y, fill = rec_data)) + 
+  geom_raster() + 
+  scale_fill_viridis_c() + 
+  coord_equal() + 
+  theme(axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank())
+
+rec_pred_plot <- ggplot(rec_comp, aes(x = x, y = y, fill = rec_pred)) + 
+  geom_raster() + 
+  scale_fill_viridis_c() + 
+  coord_equal() + 
+  theme(axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank())
+
+plot_grid(rec_data_plot, rec_pred_plot)
+
+ggplot(rec_comp, aes(x = rec_data, y = rec_pred)) + 
+  geom_point() + 
+  geom_smooth(method = "glm")
+
+cor_test <- cor.test(rec_comp$rec_data, rec_comp$rec_pred, method = "spearman")
+```
+
+Ouch, spatially look very different and small non-significant correlation between the two. Let's have a look in more detail. 
+
+```{r, eval = FALSE}
+mod <- lm(rec_data ~ rec_pred, data = rec_comp)
+summary(mod)
+```
+
+Significant model, and the slope of the predicted recreation value on the actual value is positive and significant BUT very low $R^2$ value. Where are the residuals and do they correlate with any of our predictors? 
+
+```{r, eval = FALSE}
+rec_comp$resid <- mod$residuals
+
+ggplot(rec_comp, aes(x = x, y = y, fill = resid)) + 
+  geom_raster() + 
+  scale_fill_viridis_c() + 
+  coord_equal() + 
+  theme(axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank())
+
+rec_resid_pts <- SpatialPointsDataFrame(coords = cbind(rec_comp$x, rec_comp$y), 
+                                        data = rec_comp, proj4string = crs(crs_bng))
+rec_resid_ras <- rasterize(rec_resid_pts, es_ras, 'resid')
+
+load("results/all_data.rda")
+
+all_data_5km <- stack(list(residuals = rec_resid_ras, aggregate(all_data, fact = 200)))
+
+plot(all_data_5km)
+```
+
+Where are these residuals - plot on background map: 
+
+```{r, eval = FALSE}
+rec_resid_pts <- spTransform(rec_resid_pts, CRSobj = crs_wgs84)
+rec_resid <- data.frame(rec_resid_pts@coords, rec_resid_pts@data)
+
+
+study_bbox <- c(left = -xmin, bottom = ymin, right = -xmax, top = ymax)
+mp <- get_map(location = study_bbox) 
+ggmap(mp) + 
+  geom_point(data = rec_resid, aes(x = coords.x1, y = coords.x2, colour = resid), size = 10, shape = "square", alpha = 0.6)
+```
+
+The high values that we miss are around Salisbury and the Wessex Downs. 
+
+** Compare land cover and topography fitted to rec to scaled up (access * lc_suitable, etc.) fitted against rec ** - sort upscaled variables as lower down processes. 
 
 ## References
