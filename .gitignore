@@ -36,3 +36,5 @@ vignettes/*.pdf
 # Specific ignores
 seses.Rproj
 data/
+01_Recreation_Model_files/
+results/
