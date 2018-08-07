@@ -1,7 +1,6 @@
 ---
 title: 'SESES: Recreation Model'
-author: "Laura Graham"
-output: html_document
+output: github_document
 bibliography: C:/Users/lg1u16/DATA/BIBLIOGRAPHY/library.bib
 ---
 
